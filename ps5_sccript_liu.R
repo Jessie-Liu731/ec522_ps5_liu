@@ -178,21 +178,136 @@ penalized_race("HOUST")
 ###With the ridge penalty, the model is forced to include all 121 predictors and only shrink them in the direction of zero without eliminating them. This may introduce to much estimation error and noise into the model and the consequent overfitting problem will largely reduce forecasting accuracy.
 
 
+# Part 3 - Trees, Forests, and Boosting: Peak Electricity Demand
 
+### 3.1a.
+elec <- vic_elec |>
+  index_by(Date = as_date(Time)) |>
+  summarise(Peak = max(Demand) / 1e3,          # peak half-hourly demand (GW)
+            Temp = max(Temperature),           # daily max temperature (C)
+            Holiday = any(Holiday)) |>
+  mutate(Day = wday(Date, label = TRUE),       # day of the week
+         Lag1 = lag(Peak, 1),                  # yesterday's peak
+         Lag7 = lag(Peak, 7),                  # peak one week ago
+         TempLag1 = lag(Temp, 1)) |>           # yesterday's max temperature
+  filter(!is.na(Lag7)) |>
+  as_tibble()
 
+### 3.1b. Scatterplot of Peak against Temp
 
+elec |>
+  ggplot(aes(Temp, Peak)) +
+  geom_point(alpha=0.5) +
+  labs(title = "Peak Electricity Demand vs. Temperature",
+       x = "Daily Maximum Temperature (C)", y = "Peak Demand (GWh)") +
+  theme_minimal()
 
+###There seems to be a quadratic relationship between peak electricity demand and temperature with a U-shaped pattern. 
+###It is shaped this way because when the temperature is very low, people will use more electricity for heating, and when the temperature is very high, people will use more electricity for cooling. Therefore, the peak electricity demand is higher at both ends of the temperature spectrum and lower in the middle.
 
+### 3.2. Tune Boosting on a Validation Sample
 
+features <- c("Day", "Holiday", "Temp", "Lag1", "Lag7")
 
+fit_xgb <- function(d, depth, eta, rounds) {
+  xgboost(x = d[features], y = d$Peak, nrounds = rounds, max_depth = depth,
+          learning_rate = eta, nthreads = 1, seed = 422)
+}
 
+tr <- filter(elec, year(Date) == 2012)
+va <- filter(elec, year(Date) == 2013)
 
+xgb_grid <- expand_grid(depth = c(2, 4, 6), eta = c(0.05, 0.3), rounds = c(100, 500))
+xgb_grid$val_rmse <- NA
+for (i in 1:nrow(xgb_grid)) {
+  m <- fit_xgb(tr, xgb_grid$depth[i], xgb_grid$eta[i], xgb_grid$rounds[i])
+  xgb_grid$val_rmse[i] <- sqrt(mean((va$Peak - predict(m, va[features]))^2))
+}
+xgb_grid <- arrange(xgb_grid, val_rmse)
+xgb_grid
+best <- xgb_grid[1, ]
 
+###There are 12 combinations of tuning parameters that the code given above tried. 
+###The chosen combination is the one with the lowest validation RMSE, which is depth = 2, eta (learning rate) = 0.3, and rounds (number of trees) = 100. 
+###In this example, it seems like deeper trees generally do worse than the shallow ones.
 
+### 3.3. The Horse Race
 
+test_dates <- elec$Date[year(elec$Date) == 2014]
+refit_dates <- test_dates[seq(1, length(test_dates), by = 28)]
 
+elec_fc <- NULL
+for (k in seq_along(refit_dates)) {
+  start <- refit_dates[k]
+  end <- if (k < length(refit_dates)) refit_dates[k + 1] - 1 else max(elec$Date)
+  train <- filter(elec, Date < start)
+  test <- filter(elec, Date >= start, Date <= end)
+  m_lin  <- lm(Peak ~ Day + Holiday + Temp + Lag1 + Lag7, data = train)
+  m_quad <- lm(Peak ~ Day + Holiday + Temp + I(Temp^2) + Lag1 + Lag7, data = train)
+  m_rf   <- ranger(Peak ~ Day + Holiday + Temp + Lag1 + Lag7, data = train, seed = 422)
+  m_xgb  <- fit_xgb(train, best$depth, best$eta, best$rounds)
+  elec_fc <- bind_rows(elec_fc, tibble(
+    Date = test$Date, Actual = test$Peak,
+    srw = test$Lag7,
+    linear = predict(m_lin, test),
+    quadratic = predict(m_quad, test),
+    forest = predict(m_rf, test)$predictions,
+    boosting = predict(m_xgb, test[features])))
+}
 
+elec_accuracy <- function(fc) {
+  fc |>
+    pivot_longer(-c(Date, Actual), names_to = "Model", values_to = "Forecast") |>
+    group_by(Model) |>
+    summarise(RMSE = sqrt(mean((Actual - Forecast)^2)),
+              MAE = mean(abs(Actual - Forecast))) |>
+    arrange(RMSE)
+}
+elec_accuracy(elec_fc)
 
+### 3.3a. Forecast evaluation results
+
+elec_accuracy(elec_fc)
+
+###For RMSE, the ranking from lowest (best) to highest (worst) is: boosting (0.318), quadratic (0.337), forest (0.339), linear (0.489), and seaasonal random walk (0.862).
+###For MAE, the ranking is the same with an exception that the quadratic model has a same MAE as the forest model (0.226).
+###For total daily demand in class, we found that the quadratic model was the best, but boosting has a similar level performance with a only a slightly higher RMSE. Here, boosting is the best model for forecasting peak electricity demand which is more critical for the opeartion of the electricity system.
+
+### 3.3b. 
+
+max(elec$Peak[year(elec$Date) <= 2013])
+elec_fc |> filter(Actual > max(elec$Peak[year(elec$Date) <= 2013]))
+
+###In the comparison between the actual and forecasts and boosting with the regression with temperature squared, we can see that the two tress forecast models did not manage to predict/ capture the extreme peak in 2014.
+###This is because a tree's forecast is an average of training values of y, so it can never go above the largest or below the smallest y in the training sapmle.
+###Since the extreme peak in 2014 is much higher than any peak in the training sample, and thus the models are not able to extrapolate beyond the range of the training data.
+###This could cause big issues for a grid operator because they want to ensure that there is enough capacity to meet demand and avoid blackouts. However, excepting all future demands will be in the range of previous ones could be unrealistic. Thus, with only forecasts produced by the tree forecasts, they may not be able to plan for the necessary capacity and could face risks like lackouts or other issues during periods of high demand. 
+
+### 3.4. Feature Engineering: Yesterday's Temperature
+
+features2 <- c(features, "TempLag1")       # add yesterday's temperature
+
+elec_fc2 <- NULL
+for (k in seq_along(refit_dates)) {
+  start <- refit_dates[k]
+  end <- if (k < length(refit_dates)) refit_dates[k + 1] - 1 else max(elec$Date)
+  train <- filter(elec, Date < start)
+  test <- filter(elec, Date >= start, Date <= end)
+  m_quad2 <- lm(Peak ~ Day + Holiday + Temp + I(Temp^2) + TempLag1 + I(TempLag1^2) +
+                  Lag1 + Lag7, data = train)
+  m_xgb2 <- xgboost(x = train[features2], y = train$Peak, nrounds = best$rounds,
+                    max_depth = best$depth, learning_rate = best$eta,
+                    nthreads = 1, seed = 422)
+  elec_fc2 <- bind_rows(elec_fc2, tibble(
+    Date = test$Date, Actual = test$Peak,
+    quadratic_templag = predict(m_quad2, test),
+    boosting_templag = predict(m_xgb2, test[features2])))
+}
+elec_accuracy(elec_fc2)
+
+###The RMSE of the quadratic model reduced from 0.337 to 0.272 (19%). The RMSE of the boosting model reduced from 0.318 to 0.300 (5.7%).
+###The OLS regression with temperature squared and yesterday's temperature squared is now the best overall.
+###This indicates that building better features can be more important than choosing a fancier model. Again, we need to keep the balance of using as much useful information as possible without including too much noise and errors in to our models.
 
 
 
